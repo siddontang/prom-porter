@@ -1,38 +1,25 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"io/ioutil"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"regexp"
 	"sort"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
+	"github.com/siddontang/prom-porter/util"
 
 	"github.com/dgraph-io/badger"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 )
 
-func encodeKey(ts int64, c int64) []byte {
-	var buf [16]byte
-	binary.BigEndian.PutUint64(buf[:8], uint64(ts))
-	binary.BigEndian.PutUint64(buf[8:], uint64(c))
-	return buf[:]
-}
-
-func decodeKey(buf []byte) (int64, int64) {
-	ts := int64(binary.BigEndian.Uint64(buf[:8]))
-	c := int64(binary.BigEndian.Uint64(buf[8:]))
-	return ts, c
-}
-
-func isMatched(m *prompb.LabelMatcher, metric model.Metric) bool {
-	value := string(metric[model.LabelName(m.Name)])
+func isMatched(m *prompb.LabelMatcher, value string) bool {
 	switch m.Type {
 	case prompb.LabelMatcher_EQ:
 		return m.Value == value
@@ -55,9 +42,20 @@ func isMatched(m *prompb.LabelMatcher, metric model.Metric) bool {
 	return false
 }
 
+func getMetricLabelNameMatcher(matchers []*prompb.LabelMatcher) *prompb.LabelMatcher {
+	for _, m := range matchers {
+		if m.Name == model.MetricNameLabel {
+			return m
+		}
+	}
+
+	log.Fatalf("must provide a matcher for %s", model.MetricNameLabel)
+	return nil
+}
+
 func checkMatcher(matchers []*prompb.LabelMatcher, metric model.Metric) bool {
 	for _, m := range matchers {
-		if !isMatched(m, metric) {
+		if !isMatched(m, string(metric[model.LabelName(m.Name)])) {
 			return false
 		}
 	}
@@ -71,28 +69,40 @@ func doQuery(db *badger.DB, q *prompb.Query) (*prompb.QueryResult, error) {
 
 	timeSeries := map[string]*prompb.TimeSeries{}
 
+	labelNameMatcher := getMetricLabelNameMatcher(q.Matchers)
+
 	err := db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
 		defer it.Close()
-		it.Seek(encodeKey(start, 0))
+		it.Seek(util.EncodeKey(start, 0, nil))
 
 		for ; it.Valid(); it.Next() {
 			item := it.Item()
-			ts, _ := decodeKey(item.Key())
+			ts, _, key := util.DecodeKey(item.Key())
 			if ts > end {
 				break
 			}
 
-			value, err1 := item.Value()
-			if err1 != nil {
-				return err1
+			if !isMatched(labelNameMatcher, string(key)) {
+				continue
+			}
+
+			item1, err := txn.Get(item.Key())
+			if err != nil {
+				return err
+			}
+
+			value, err := item1.Value()
+			if err != nil {
+				return err
 			}
 
 			var sample model.Sample
-			err1 = json.Unmarshal(value, &sample)
-			if err1 != nil {
-				return err1
+			err = json.Unmarshal(value, &sample)
+			if err != nil {
+				return err
 			}
 
 			metricKey := sample.Metric.String()

@@ -1,12 +1,12 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -14,25 +14,13 @@ import (
 	"github.com/dgraph-io/badger"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
+	"github.com/siddontang/prom-porter/util"
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 )
 
 var counter int64 = 0
-
-func encodeKey(ts int64, c int64) []byte {
-	var buf [16]byte
-	binary.BigEndian.PutUint64(buf[:8], uint64(ts))
-	binary.BigEndian.PutUint64(buf[8:], uint64(c))
-	return buf[:]
-}
-
-func decodeKey(buf []byte) (int64, int64) {
-	ts := int64(binary.BigEndian.Uint64(buf[:8]))
-	c := int64(binary.BigEndian.Uint64(buf[8:]))
-	return ts, c
-}
 
 func getLastCounter(db *badger.DB) {
 	err := db.View(func(txn *badger.Txn) error {
@@ -41,10 +29,10 @@ func getLastCounter(db *badger.DB) {
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
 		defer it.Close()
-		it.Seek(encodeKey(math.MaxInt64, math.MaxInt64))
+		it.Seek(util.EncodeKey(math.MaxInt64, math.MaxInt64, nil))
 		if it.Valid() {
 			item := it.Item()
-			_, counter = decodeKey(item.Key())
+			_, counter, _ = util.DecodeKey(item.Key())
 		}
 		return nil
 	})
@@ -78,21 +66,54 @@ func handleDump(db *badger.DB) {
 			opts := badger.DefaultIteratorOptions
 			it := txn.NewIterator(opts)
 			defer it.Close()
-			it.Seek(encodeKey(start, 0))
+			it.Seek(util.EncodeKey(start, 0, nil))
+
+			keys := make([][]byte, 0, 1024)
+			values := make([][]byte, 0, 1024)
 			for ; it.Valid(); it.Next() {
 				item := it.Item()
-				ts, _ := decodeKey(item.Key())
+				ts, _, _ := util.DecodeKey(item.Key())
 				if ts > end {
 					return nil
 				}
 
+				keys = append(keys, item.KeyCopy(nil))
+				value, err := item.ValueCopy(nil)
+				if err != nil {
+					log.Fatalf("get %q value failed %v", item.Key(), err)
+				}
+				values = append(values, value)
+
+				if len(keys) >= 1024 {
+					// TODO: use batch
+					err1 := backupDB.Update(func(txn1 *badger.Txn) error {
+						for i := 0; i < len(keys); i++ {
+							if err := txn1.Set(keys[i], values[i]); err != nil {
+								return err
+							}
+						}
+
+						return nil
+					})
+
+					keys = keys[0:0]
+					values = values[0:0]
+					if err1 != nil {
+						return err1
+					}
+				}
+			}
+
+			if len(keys) >= 0 {
 				// TODO: use batch
 				err1 := backupDB.Update(func(txn1 *badger.Txn) error {
-					value, err2 := item.Value()
-					if err2 != nil {
-						return err2
+					for i := 0; i < len(keys); i++ {
+						if err := txn1.Set(keys[i], values[i]); err != nil {
+							return err
+						}
 					}
-					return txn1.Set(item.Key(), value)
+
+					return nil
 				})
 
 				if err1 != nil {
@@ -131,11 +152,11 @@ func handleWrite(db *badger.DB) {
 
 		err = db.Update(func(txn *badger.Txn) error {
 			samples := protoToSamples(&req)
-
 			for _, sample := range samples {
 				newCounter := atomic.AddInt64(&counter, 1)
+				metricName := sample.Metric[model.MetricNameLabel]
 
-				key := encodeKey(int64(sample.Timestamp), newCounter)
+				key := util.EncodeKey(int64(sample.Timestamp), newCounter, []byte(metricName))
 				buf, err := json.Marshal(&sample)
 				if err != nil {
 					log.Fatalf("encode metric %s failed %v", sample, err)
