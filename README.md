@@ -34,3 +34,7 @@ remote_read:
 + [remote-endpoints-and-storage](https://prometheus.io/docs/operating/integrations/#remote-endpoints-and-storage)
 + [remote-storage-integrations](https://prometheus.io/docs/prometheus/latest/storage/#remote-storage-integrations)
 + [remote_storage_adapter](https://github.com/prometheus/prometheus/tree/master/documentation/examples/remote_storage/remote_storage_adapter)
+
+## TODO
+
++ Support porting TiDB metrics and showing them on Grafana.
