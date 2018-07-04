@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 
 	"github.com/gogo/protobuf/proto"
@@ -30,15 +31,38 @@ func decodeKey(buf []byte) (int64, int64) {
 	return ts, c
 }
 
-func checkMatcher(q *prompb.Query, sample *model.Sample) bool {
-	// TODO: check matcher
-	for _, matcher := range q.Matchers {
-		if string(sample.Metric[model.LabelName(matcher.Name)]) == matcher.Value {
-			return true
+func isMatched(m *prompb.LabelMatcher, metric model.Metric) bool {
+	value := string(metric[model.LabelName(m.Name)])
+	switch m.Type {
+	case prompb.LabelMatcher_EQ:
+		return m.Value == value
+	case prompb.LabelMatcher_NEQ:
+		return m.Value != value
+	case prompb.LabelMatcher_RE:
+		re, err := regexp.Compile("^(?:" + m.Value + ")$")
+		if err != nil {
+			log.Fatalf("create regexp for %s failed %v", m.Value, err)
 		}
+		return re.MatchString(value)
+	case prompb.LabelMatcher_NRE:
+		re, err := regexp.Compile("^(?:" + m.Value + ")$")
+		if err != nil {
+			log.Fatalf("create regexp for %s failed %v", m.Value, err)
+		}
+		return !re.MatchString(value)
 	}
 
 	return false
+}
+
+func checkMatcher(matchers []*prompb.LabelMatcher, metric model.Metric) bool {
+	for _, m := range matchers {
+		if !isMatched(m, metric) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func doQuery(db *badger.DB, q *prompb.Query) (*prompb.QueryResult, error) {
@@ -51,7 +75,6 @@ func doQuery(db *badger.DB, q *prompb.Query) (*prompb.QueryResult, error) {
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
 		defer it.Close()
-		log.Printf("search in ts [%d, %d]", start, end)
 		it.Seek(encodeKey(start, 0))
 
 		for ; it.Valid(); it.Next() {
@@ -75,7 +98,7 @@ func doQuery(db *badger.DB, q *prompb.Query) (*prompb.QueryResult, error) {
 			metricKey := sample.Metric.String()
 			series, ok := timeSeries[metricKey]
 			if !ok {
-				if !checkMatcher(q, &sample) {
+				if !checkMatcher(q.Matchers, sample.Metric) {
 					continue
 				}
 
