@@ -2,6 +2,21 @@
 
 Dump a time range data from Prometheus and load to another Prometheus for query. 
 
+## Architecture
+
+```
++------------------+  write   +---------------+  dump   +-----------+
+| User Prometheus  | -------> | Write Storage | ------> | Dump Data |
++------------------+          +---------------+         +-----------+
+                                                          |
+                                                          |
+                                                          |
+                                                          |
++------------------+  read    +---------------+  load     |
+| Local Prometheus | -------> | Read Storage  | <---------+
++------------------+          +---------------+           
+```
+
 ## Usage
 
 ### Write
